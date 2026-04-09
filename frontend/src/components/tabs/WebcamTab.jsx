@@ -1,23 +1,21 @@
 // ─────────────────────────────────────────────────────────
 //  Webcam Tab — live camera with canvas overlay
-//  (Simulates bounding box; real boxes drawn by Python/OpenCV)
 // ─────────────────────────────────────────────────────────
 import { useRef, useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
 
 export default function WebcamTab({ detection }) {
   const { status } = detection
-  const videoRef   = useRef(null)
-  const canvasRef  = useRef(null)
-  const streamRef  = useRef(null)
-  const animRef    = useRef(null)
+  const videoRef  = useRef(null)
+  const canvasRef = useRef(null)
+  const streamRef = useRef(null)
+  const animRef   = useRef(null)
 
   const [camActive,   setCamActive]   = useState(false)
   const [camError,    setCamError]    = useState('')
   const [frameCount,  setFrameCount]  = useState(0)
   const [localDetect, setLocalDetect] = useState(0)
 
-  // Keep a ref of status to avoid stale closure
   const statusRef = useRef(status)
   useEffect(() => { statusRef.current = status }, [status])
 
@@ -28,7 +26,8 @@ export default function WebcamTab({ detection }) {
         video: { width: 640, height: 480 },
         audio: false,
       })
-      streamRef.current    = stream
+      streamRef.current = stream
+      // videoRef.current is ALWAYS mounted now — no null risk
       videoRef.current.srcObject = stream
       await videoRef.current.play()
       setCamActive(true)
@@ -49,6 +48,7 @@ export default function WebcamTab({ detection }) {
     }
     const ctx = canvasRef.current?.getContext('2d')
     if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
+    if (videoRef.current) videoRef.current.srcObject = null
     setCamActive(false)
     setFrameCount(0)
     setLocalDetect(0)
@@ -67,12 +67,9 @@ export default function WebcamTab({ detection }) {
 
       canvas.width  = video.videoWidth  || 640
       canvas.height = video.videoHeight || 480
-
       ctx.clearRect(0, 0, canvas.width, canvas.height)
 
       const st = statusRef.current
-
-      // If backend says fire detected, draw a bounding box overlay
       if (st.fire_detected) {
         const cx = canvas.width  * 0.4 + Math.sin(fc * 0.05) * 30
         const cy = canvas.height * 0.4 + Math.cos(fc * 0.04) * 20
@@ -81,18 +78,14 @@ export default function WebcamTab({ detection }) {
         const x  = cx - bw / 2
         const y  = cy - bh / 2
 
-        // Outer glow
         ctx.shadowColor = '#FF2D00'
         ctx.shadowBlur  = 16
         ctx.strokeStyle = '#FF2D00'
         ctx.lineWidth   = 3
         ctx.strokeRect(x, y, bw, bh)
         ctx.shadowBlur  = 0
-
-        // Corner brackets
         drawCorners(ctx, x, y, bw, bh, '#FF2D00')
 
-        // Label
         const conf = st.confidence
         ctx.fillStyle = 'rgba(255,45,0,0.85)'
         ctx.fillRect(x, y - 28, 140, 28)
@@ -103,16 +96,13 @@ export default function WebcamTab({ detection }) {
         setLocalDetect(prev => prev + 1)
       }
 
-      // Scan line
-      const scanY  = (fc * 2) % canvas.height
-      const grad   = ctx.createLinearGradient(0, scanY - 6, 0, scanY + 6)
+      const scanY = (fc * 2) % canvas.height
+      const grad  = ctx.createLinearGradient(0, scanY - 6, 0, scanY + 6)
       grad.addColorStop(0, 'transparent')
       grad.addColorStop(0.5, 'rgba(255,107,0,0.06)')
       grad.addColorStop(1, 'transparent')
       ctx.fillStyle = grad
       ctx.fillRect(0, scanY - 6, canvas.width, 12)
-
-      // Corner crosshairs
       drawCrosshairs(ctx, canvas.width, canvas.height)
     }
 
@@ -122,17 +112,14 @@ export default function WebcamTab({ detection }) {
   useEffect(() => () => stopCamera(), [])
 
   return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      className="space-y-5"
-    >
+    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-5">
+
       {/* Stats row */}
       <div className="grid grid-cols-3 gap-4">
         {[
-          { label: 'Frames',    value: frameCount },
+          { label: 'Frames',     value: frameCount  },
           { label: 'Detections', value: localDetect },
-          { label: 'FPS',       value: status.fps || '—' },
+          { label: 'FPS',        value: status.fps || '—' },
         ].map(m => (
           <div key={m.label} className="card text-center">
             <div className="font-display text-2xl font-bold text-fire-orange">{m.value}</div>
@@ -141,9 +128,11 @@ export default function WebcamTab({ detection }) {
         ))}
       </div>
 
-      {/* Camera view */}
+      {/* Camera view — video/canvas ALWAYS in DOM to avoid null ref */}
       <div className="card flex flex-col items-center">
-        {!camActive ? (
+
+        {/* Placeholder shown only when camera is off */}
+        {!camActive && (
           <div className="text-center py-12">
             <div className="text-5xl mb-4">📷</div>
             <p className="text-muted mb-6 text-sm">Start your webcam to enable live overlay detection</p>
@@ -157,29 +146,35 @@ export default function WebcamTab({ detection }) {
               ▶ START WEBCAM
             </motion.button>
           </div>
-        ) : (
-          <>
-            <div className="relative inline-block border-2 border-fire-red/40 rounded-xl overflow-hidden shadow-[0_0_40px_rgba(255,45,0,0.2)]">
-              <video ref={videoRef} muted className="block w-full max-w-2xl" style={{ maxHeight: '480px' }} />
-              <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
-              {/* HUD overlay */}
-              <div className="absolute top-3 left-3 right-3 flex justify-between pointer-events-none">
-                <div className={`font-mono text-xs px-3 py-1 rounded-full border ${status.fire_detected ? 'bg-fire-red/80 border-fire-red text-white' : 'bg-black/50 border-white/10 text-green-400'}`}>
-                  {status.fire_detected ? '🔥 FIRE DETECTED' : '● MONITORING'}
-                </div>
-                <div className="font-mono text-xs px-3 py-1 rounded-full bg-black/50 border border-white/10 text-white">
-                  {status.fps} FPS
-                </div>
+        )}
+
+        {/* Video + canvas — always rendered, hidden when inactive */}
+        <div style={{ display: camActive ? 'flex' : 'none' }} className="flex-col items-center">
+          <div className="relative inline-block border-2 border-fire-red/40 rounded-xl overflow-hidden shadow-[0_0_40px_rgba(255,45,0,0.2)]">
+            <video
+              ref={videoRef}
+              muted
+              playsInline
+              className="block w-full max-w-2xl"
+              style={{ maxHeight: '480px' }}
+            />
+            <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+            <div className="absolute top-3 left-3 right-3 flex justify-between pointer-events-none">
+              <div className={`font-mono text-xs px-3 py-1 rounded-full border ${status.fire_detected ? 'bg-fire-red/80 border-fire-red text-white' : 'bg-black/50 border-white/10 text-green-400'}`}>
+                {status.fire_detected ? '🔥 FIRE DETECTED' : '● MONITORING'}
+              </div>
+              <div className="font-mono text-xs px-3 py-1 rounded-full bg-black/50 border border-white/10 text-white">
+                {status.fps} FPS
               </div>
             </div>
-            <button
-              onClick={stopCamera}
-              className="mt-4 px-6 py-2 rounded-xl border border-red-500/30 text-red-400 text-xs font-mono hover:bg-red-500/10 transition-colors tracking-wider"
-            >
-              ⏹ STOP WEBCAM
-            </button>
-          </>
-        )}
+          </div>
+          <button
+            onClick={stopCamera}
+            className="mt-4 px-6 py-2 rounded-xl border border-red-500/30 text-red-400 text-xs font-mono hover:bg-red-500/10 transition-colors tracking-wider"
+          >
+            ⏹ STOP WEBCAM
+          </button>
+        </div>
       </div>
 
       {/* Note */}
@@ -200,13 +195,9 @@ function drawCorners(ctx, x, y, w, h, color) {
   ctx.lineWidth   = 3
   ctx.shadowColor = color
   ctx.shadowBlur  = 8
-  // TL
   ctx.beginPath(); ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y); ctx.stroke()
-  // TR
   ctx.beginPath(); ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len); ctx.stroke()
-  // BL
   ctx.beginPath(); ctx.moveTo(x, y + h - len); ctx.lineTo(x, y + h); ctx.lineTo(x + len, y + h); ctx.stroke()
-  // BR
   ctx.beginPath(); ctx.moveTo(x + w - len, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - len); ctx.stroke()
   ctx.shadowBlur = 0
 }

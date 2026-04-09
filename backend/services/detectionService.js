@@ -1,157 +1,194 @@
 // ─────────────────────────────────────────────────────────
 //  Detection Service
-//  Spawns fire.py as a child process, parses its stdout,
-//  maintains state, and broadcasts via Socket.io
+//  Spawns fire_ws.py as child process. If Python/model is
+//  unavailable, automatically falls back to DEMO mode.
 // ─────────────────────────────────────────────────────────
-const { spawn } = require('child_process');
-const path      = require('path');
-const fs        = require('fs');
+const { spawn }      = require('child_process');
+const path           = require('path');
+const fs             = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
-let io          = null;   // Socket.io instance
-let pyProcess   = null;   // Python child process
-let isRunning   = false;
+let io           = null;
+let pyProcess    = null;
+let demoInterval = null;
+let isRunning    = false;
+let startTime    = null;
+let logs         = [];
 
-// ── In-memory state ───────────────────────────────────────
+// ── Live state broadcast to all socket clients ────────────
 let state = {
-  fire_detected:    false,
-  confidence:       0,
-  total_detections: 0,
+  fire_detected:       false,
+  confidence:          0,
+  total_detections:    0,
   last_detection_time: null,
-  fps:              0,
-  uptime_seconds:   0,
-  is_running:       false,
+  fps:                 0,
+  uptime_seconds:      0,
+  is_running:          false,
+  mode:                'idle',   // 'idle' | 'python' | 'demo'
 };
 
-let logs      = [];   // Detection log entries
-let startTime = null;
-
-// ── Simulate detection data when Python isn't available ──
-// (for dev/demo mode without a real camera)
-let demoInterval = null;
-
-// ── Set Socket.io instance ────────────────────────────────
+// ── Inject Socket.io instance (called from server.js) ─────
 function setIO(socketIO) {
   io = socketIO;
 }
 
-// ── Start Detection ───────────────────────────────────────
+// ── Start detection ───────────────────────────────────────
 async function start() {
   if (isRunning) return;
 
-  isRunning  = true;
-  startTime  = Date.now();
+  isRunning        = true;
+  startTime        = Date.now();
   state.is_running = true;
 
   const pythonPath = process.env.PYTHON_PATH || 'python3';
   const scriptPath = path.join(__dirname, '..', 'fire_ws.py');
   const modelPath  = process.env.MODEL_PATH  || 'models/fire.pt';
+  const modelExists  = fs.existsSync(path.join(__dirname, '..', modelPath));
+  const scriptExists = fs.existsSync(scriptPath);
 
-  // Check if the Python script exists
-  if (!fs.existsSync(scriptPath)) {
-    console.warn('[Detection] fire_ws.py not found — running in DEMO mode');
+  // Fall back to demo if script or model is missing
+  if (!scriptExists || !modelExists) {
+    const reason = !scriptExists ? 'fire_ws.py not found' : `model not found at ${modelPath}`;
+    console.warn(`[Detection] ${reason} — starting DEMO mode`);
     startDemoMode();
     broadcastStatus();
     return;
   }
 
-  console.log(`[Detection] Spawning: ${pythonPath} ${scriptPath}`);
+  console.log(`[Detection] Spawning Python: ${pythonPath} ${scriptPath}`);
+  state.mode = 'python';
 
   pyProcess = spawn(pythonPath, [scriptPath, '--model', modelPath], {
     cwd: path.join(__dirname, '..'),
   });
 
-  // Parse JSON lines from Python stdout
+  // Give Python 8 seconds to emit its first frame.
+  // If nothing comes, fall back to demo mode automatically.
+  const fallbackTimer = setTimeout(() => {
+    if (isRunning && state.fps === 0) {
+      console.warn('[Detection] No frames received from Python after 8s — falling back to DEMO mode');
+      if (pyProcess) { pyProcess.kill(); pyProcess = null; }
+      startDemoMode();
+    }
+  }, 8000);
+
+  // ── Parse JSON lines from Python stdout ──────────────────
   pyProcess.stdout.on('data', (data) => {
+    clearTimeout(fallbackTimer);
     const lines = data.toString().split('\n').filter(Boolean);
     for (const line of lines) {
       try {
-        const parsed = JSON.parse(line);
-        handlePythonEvent(parsed);
+        handlePythonEvent(JSON.parse(line));
       } catch {
-        // Non-JSON output (e.g. YOLO loading messages) — just log it
-        console.log(`[Python] ${line}`);
+        console.log(`[Python stdout] ${line}`);
       }
     }
   });
 
   pyProcess.stderr.on('data', (data) => {
-    console.error(`[Python ERR] ${data}`);
+    // YOLO prints a lot to stderr during loading — only log real errors
+    const msg = data.toString();
+    if (msg.includes('Error') || msg.includes('error')) {
+      console.error(`[Python ERR] ${msg.trim()}`);
+    }
   });
 
   pyProcess.on('close', (code) => {
-    console.log(`[Detection] Python process exited with code ${code}`);
-    isRunning = false;
-    state.is_running = false;
-    state.fire_detected = false;
-    broadcastStatus();
+    clearTimeout(fallbackTimer);
+    console.log(`[Detection] Python exited with code ${code}`);
+    // If it exited unexpectedly while we're still "running", fall back to demo
+    if (isRunning) {
+      console.warn('[Detection] Python crashed — falling back to DEMO mode');
+      startDemoMode();
+    }
+  });
+
+  pyProcess.on('error', (err) => {
+    clearTimeout(fallbackTimer);
+    console.error(`[Detection] Failed to spawn Python: ${err.message}`);
+    console.warn('[Detection] Falling back to DEMO mode');
+    startDemoMode();
   });
 
   broadcastStatus();
 }
 
-// ── Handle events coming from Python ─────────────────────
+// ── Handle JSON events from Python stdout ─────────────────
 function handlePythonEvent(event) {
-  if (event.type === 'frame') {
-    const wasDetected = state.fire_detected;
+  if (event.type !== 'frame') return;
 
-    state.fire_detected = event.fire_detected;
-    state.confidence    = event.confidence || 0;
-    state.fps           = event.fps || 0;
-    state.uptime_seconds = Math.floor((Date.now() - startTime) / 1000);
+  const wasDetected    = state.fire_detected;
+  state.fire_detected  = event.fire_detected;
+  state.confidence     = parseFloat((event.confidence || 0).toFixed(1));
+  state.fps            = parseFloat((event.fps        || 0).toFixed(1));
+  state.uptime_seconds = Math.floor((Date.now() - startTime) / 1000);
 
-    if (event.fire_detected) {
-      state.total_detections++;
-      state.last_detection_time = new Date().toISOString();
-
-      const entry = addLog({
-        confidence: event.confidence,
-        severity:   getSeverity(event.confidence),
-        fps:        event.fps,
-      });
-
-      // Emit specific fire_detected event for frontend alarm trigger
-      if (!wasDetected) {
-        io?.emit('fire_detected', { confidence: event.confidence, log: entry });
-      }
+  if (event.fire_detected) {
+    state.total_detections++;
+    state.last_detection_time = new Date().toISOString();
+    const entry = addLog({ confidence: state.confidence, severity: getSeverity(state.confidence), fps: state.fps });
+    if (!wasDetected) {
+      io?.emit('fire_detected', { confidence: state.confidence, log: entry });
     }
-
-    broadcastStatus();
   }
+
+  broadcastStatus();
 }
 
-// ── Demo mode (no camera/Python available) ────────────────
+// ── Demo mode — realistic simulated fire events ───────────
 function startDemoMode() {
-  let demoFrame = 0;
+  // Don't start twice
+  if (demoInterval) return;
+
+  state.mode       = 'demo';
+  state.is_running = true;
+  if (!startTime) startTime = Date.now();
+
+  console.log('[Detection] DEMO mode running — simulating fire events');
+
+  let tick = 0;
 
   demoInterval = setInterval(() => {
-    demoFrame++;
-    const fireChance = Math.random();
-    const detected   = fireChance > 0.85;
-    const conf       = detected ? Math.random() * 20 + 76 : Math.random() * 30 + 10;
+    tick++;
 
-    state.fire_detected   = detected;
-    state.confidence      = parseFloat(conf.toFixed(1));
-    state.fps             = parseFloat((14 + Math.random() * 4).toFixed(1));
-    state.uptime_seconds  = Math.floor((Date.now() - startTime) / 1000);
-    state.is_running      = true;
+    // Simulate realistic pattern: mostly clear, occasional fire bursts
+    const inBurst   = (tick % 40) > 30;          // fire burst every 40 ticks
+    const detected  = inBurst && Math.random() > 0.3;
+    const conf      = detected
+      ? parseFloat((76 + Math.random() * 20).toFixed(1))   // 76–96%
+      : parseFloat((5  + Math.random() * 25).toFixed(1));  // 5–30%
+
+    const wasDetected       = state.fire_detected;
+    state.fire_detected     = detected;
+    state.confidence        = conf;
+    state.fps               = parseFloat((12 + Math.random() * 6).toFixed(1));
+    state.uptime_seconds    = Math.floor((Date.now() - startTime) / 1000);
+    state.is_running        = true;
 
     if (detected) {
       state.total_detections++;
       state.last_detection_time = new Date().toISOString();
-      const entry = addLog({ confidence: state.confidence, severity: getSeverity(state.confidence), fps: state.fps });
-      io?.emit('fire_detected', { confidence: state.confidence, log: entry });
+      const entry = addLog({
+        confidence: state.confidence,
+        severity:   getSeverity(state.confidence),
+        fps:        state.fps,
+      });
+      if (!wasDetected) {
+        io?.emit('fire_detected', { confidence: state.confidence, log: entry });
+      }
     }
 
     broadcastStatus();
   }, 500);
 }
 
-// ── Stop Detection ────────────────────────────────────────
+// ── Stop detection ────────────────────────────────────────
 async function stop() {
-  isRunning = false;
-  state.is_running    = false;
-  state.fire_detected = false;
+  isRunning            = false;
+  state.is_running     = false;
+  state.fire_detected  = false;
+  state.fps            = 0;
+  state.mode           = 'idle';
 
   if (pyProcess) {
     pyProcess.kill('SIGTERM');
@@ -166,24 +203,22 @@ async function stop() {
   broadcastStatus();
 }
 
-// ── Broadcast via Socket.io ───────────────────────────────
+// ── Broadcast current state to all Socket.io clients ─────
 function broadcastStatus() {
-  if (io) {
-    io.emit('status', getStatus());
-  }
+  io?.emit('status', getStatus());
 }
 
-// ── Add log entry ─────────────────────────────────────────
+// ── Add a log entry + emit to clients ─────────────────────
 function addLog({ confidence, severity, fps }) {
   const entry = {
-    id:          uuidv4(),
-    timestamp:   new Date().toISOString(),
-    confidence:  parseFloat((confidence || 0).toFixed(1)),
+    id:         uuidv4(),
+    timestamp:  new Date().toISOString(),
+    confidence: parseFloat((confidence || 0).toFixed(1)),
     severity,
-    fps:         parseFloat((fps || 0).toFixed(1)),
+    fps:        parseFloat((fps        || 0).toFixed(1)),
   };
   logs.unshift(entry);
-  if (logs.length > 500) logs = logs.slice(0, 500); // cap at 500 entries
+  if (logs.length > 500) logs = logs.slice(0, 500);
   io?.emit('log', entry);
   return entry;
 }
@@ -204,12 +239,8 @@ function getLogs(limit = 100) {
 }
 
 function getAnalytics() {
-  // Build hourly buckets for the last 24h
-  const now    = Date.now();
   const hourly = Array.from({ length: 24 }, (_, i) => ({
-    hour:       i,
-    detections: 0,
-    avg_conf:   0,
+    hour: i, detections: 0, avg_conf: 0,
   }));
 
   logs.forEach(log => {
@@ -221,13 +252,16 @@ function getAnalytics() {
   });
 
   const severityCounts = { HIGH: 0, MED: 0, LOW: 0 };
-  logs.forEach(l => { if (severityCounts[l.severity] !== undefined) severityCounts[l.severity]++; });
+  logs.forEach(l => {
+    if (severityCounts[l.severity] !== undefined) severityCounts[l.severity]++;
+  });
 
   return {
     hourly,
     severity_distribution: severityCounts,
-    total_detections: state.total_detections,
-    uptime_seconds:   state.uptime_seconds,
+    total_detections:      state.total_detections,
+    uptime_seconds:        state.uptime_seconds,
+    mode:                  state.mode,
   };
 }
 

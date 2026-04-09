@@ -23,13 +23,22 @@ export default function WebcamTab({ detection }) {
         video: { width: 640, height: 480 },
         audio: false,
       })
-      streamRef.current          = stream
-      videoRef.current.srcObject = stream
-      await videoRef.current.play()
-      setCamActive(true)
-      startOverlay()
+      streamRef.current = stream
+      const video = videoRef.current
+      video.srcObject = stream
+      video.onloadedmetadata = async () => {
+        await video.play()
+        setCamActive(true)
+        startOverlay()
+      }
     } catch (err) {
-      setCamError(`Camera error: ${err.message}`)
+      if (err.name === 'NotAllowedError') {
+        setCamError('Camera permission denied. Please allow camera access in your browser.')
+      } else if (err.name === 'NotFoundError') {
+        setCamError('No camera found. Please connect a webcam.')
+      } else {
+        setCamError(`Camera error: ${err.message}`)
+      }
     }
   }
 
@@ -42,10 +51,11 @@ export default function WebcamTab({ detection }) {
       cancelAnimationFrame(animRef.current)
       animRef.current = null
     }
+    if (videoRef.current) videoRef.current.srcObject = null
     const ctx = canvasRef.current?.getContext('2d')
     if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
-    if (videoRef.current) videoRef.current.srcObject = null
     setCamActive(false)
+    setCamError('')
     setFrameCount(0)
     setLocalDetect(0)
   }
@@ -53,14 +63,14 @@ export default function WebcamTab({ detection }) {
   function startOverlay() {
     const video  = videoRef.current
     const canvas = canvasRef.current
-    const ctx    = canvas.getContext('2d')
+    if (!video || !canvas) return
+    const ctx = canvas.getContext('2d')
     let fc = 0
 
     function draw() {
       animRef.current = requestAnimationFrame(draw)
       fc++
       setFrameCount(fc)
-
       canvas.width  = video.videoWidth  || 640
       canvas.height = video.videoHeight || 480
       ctx.clearRect(0, 0, canvas.width, canvas.height)
@@ -73,22 +83,16 @@ export default function WebcamTab({ detection }) {
         const bh = 120 + Math.cos(fc * 0.07) * 15
         const x  = cx - bw / 2
         const y  = cy - bh / 2
-
-        ctx.shadowColor = '#FF2D00'
-        ctx.shadowBlur  = 16
-        ctx.strokeStyle = '#FF2D00'
-        ctx.lineWidth   = 3
+        ctx.shadowColor = '#FF2D00'; ctx.shadowBlur = 16
+        ctx.strokeStyle = '#FF2D00'; ctx.lineWidth = 3
         ctx.strokeRect(x, y, bw, bh)
-        ctx.shadowBlur  = 0
+        ctx.shadowBlur = 0
         drawCorners(ctx, x, y, bw, bh, '#FF2D00')
-
-        const conf = st.confidence
         ctx.fillStyle = 'rgba(255,45,0,0.85)'
         ctx.fillRect(x, y - 28, 140, 28)
         ctx.fillStyle = '#ffffff'
-        ctx.font      = 'bold 13px monospace'
-        ctx.fillText(`fire  ${conf}%`, x + 8, y - 8)
-
+        ctx.font = 'bold 13px monospace'
+        ctx.fillText(`fire  ${st.confidence}%`, x + 8, y - 8)
         setLocalDetect(prev => prev + 1)
       }
 
@@ -101,7 +105,6 @@ export default function WebcamTab({ detection }) {
       ctx.fillRect(0, scanY - 6, canvas.width, 12)
       drawCrosshairs(ctx, canvas.width, canvas.height)
     }
-
     draw()
   }
 
@@ -110,7 +113,7 @@ export default function WebcamTab({ detection }) {
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-5">
 
-      {/* Stats row */}
+      {/* Stats */}
       <div className="grid grid-cols-3 gap-4">
         {[
           { label: 'Frames',     value: frameCount  },
@@ -124,15 +127,62 @@ export default function WebcamTab({ detection }) {
         ))}
       </div>
 
-      {/* Camera view */}
+      {/* Camera card */}
       <div className="card flex flex-col items-center">
 
-        {/* Placeholder — only shown when camera is off */}
+        {/* ── video + canvas are ALWAYS in the DOM ──
+            This guarantees videoRef.current is never null.
+            We show/hide the wrapper with CSS only.        */}
+        <div style={{ display: camActive ? 'block' : 'none' }}>
+          <div className="relative border-2 border-fire-red/40 rounded-xl overflow-hidden shadow-[0_0_40px_rgba(255,45,0,0.2)]">
+            <video
+              ref={videoRef}
+              muted
+              playsInline
+              style={{ display: 'block', width: '640px', maxWidth: '100%', height: '480px', objectFit: 'cover', background: '#000' }}
+            />
+            <canvas
+              ref={canvasRef}
+              style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none' }}
+            />
+            <div style={{ position: 'absolute', top: 12, left: 12, right: 12, display: 'flex', justifyContent: 'space-between', pointerEvents: 'none' }}>
+              <div
+                className="font-mono text-xs px-3 py-1 rounded-full border"
+                style={status.fire_detected
+                  ? { background: 'rgba(255,45,0,0.8)', borderColor: '#FF2D00', color: '#fff' }
+                  : { background: 'rgba(0,0,0,0.5)', borderColor: 'rgba(255,255,255,0.1)', color: '#4ade80' }}
+              >
+                {status.fire_detected ? '🔥 FIRE DETECTED' : '● MONITORING'}
+              </div>
+              <div
+                className="font-mono text-xs px-3 py-1 rounded-full"
+                style={{ background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.1)', color: '#fff' }}
+              >
+                {status.fps} FPS
+              </div>
+            </div>
+          </div>
+          <div className="flex justify-center mt-4">
+            <button
+              onClick={stopCamera}
+              className="px-6 py-2 rounded-xl border border-red-500/30 text-red-400 text-xs font-mono hover:bg-red-500/10 transition-colors tracking-wider"
+            >
+              ■ STOP WEBCAM
+            </button>
+          </div>
+        </div>
+
+        {/* Start screen — shown when camera is off */}
         {!camActive && (
           <div className="text-center py-12">
             <div className="text-5xl mb-4">📷</div>
-            <p className="text-muted mb-6 text-sm">Start your webcam to enable live overlay detection</p>
-            {camError && <p className="text-fire-red text-sm mb-4 font-mono">{camError}</p>}
+            <p className="text-muted mb-2 text-sm">Start your webcam to enable live overlay detection</p>
+            <p className="text-muted/50 text-xs mb-6 font-mono">Allow camera permissions when prompted</p>
+            {camError && (
+              <div className="mb-5 mx-auto max-w-md px-4 py-3 rounded-lg bg-fire-red/10 border border-fire-red/30 text-fire-red text-xs font-mono text-left">
+                {camError}
+              </div>
+            )}
             <motion.button
               whileHover={{ scale: 1.04 }}
               whileTap={{ scale: 0.96 }}
@@ -143,34 +193,6 @@ export default function WebcamTab({ detection }) {
             </motion.button>
           </div>
         )}
-
-        {/* Video + canvas — ALWAYS in DOM so ref is never null */}
-        <div style={{ display: camActive ? 'flex' : 'none' }} className="flex-col items-center w-full">
-          <div className="relative inline-block border-2 border-fire-red/40 rounded-xl overflow-hidden shadow-[0_0_40px_rgba(255,45,0,0.2)]">
-            <video
-              ref={videoRef}
-              muted
-              playsInline
-              className="block w-full max-w-2xl"
-              style={{ maxHeight: '480px' }}
-            />
-            <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
-            <div className="absolute top-3 left-3 right-3 flex justify-between pointer-events-none">
-              <div className={`font-mono text-xs px-3 py-1 rounded-full border ${status.fire_detected ? 'bg-fire-red/80 border-fire-red text-white' : 'bg-black/50 border-white/10 text-green-400'}`}>
-                {status.fire_detected ? '🔥 FIRE DETECTED' : '● MONITORING'}
-              </div>
-              <div className="font-mono text-xs px-3 py-1 rounded-full bg-black/50 border border-white/10 text-white">
-                {status.fps} FPS
-              </div>
-            </div>
-          </div>
-          <button
-            onClick={stopCamera}
-            className="mt-4 px-6 py-2 rounded-xl border border-red-500/30 text-red-400 text-xs font-mono hover:bg-red-500/10 transition-colors tracking-wider"
-          >
-            ⏹ STOP WEBCAM
-          </button>
-        </div>
       </div>
 
       {/* Note */}
@@ -181,29 +203,26 @@ export default function WebcamTab({ detection }) {
           running on your server. Start detection via the top bar to activate the Python pipeline.
         </p>
       </div>
+
     </motion.div>
   )
 }
 
 function drawCorners(ctx, x, y, w, h, color) {
   const len = 20
-  ctx.strokeStyle = color
-  ctx.lineWidth   = 3
-  ctx.shadowColor = color
-  ctx.shadowBlur  = 8
-  ctx.beginPath(); ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y); ctx.stroke()
-  ctx.beginPath(); ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len); ctx.stroke()
-  ctx.beginPath(); ctx.moveTo(x, y + h - len); ctx.lineTo(x, y + h); ctx.lineTo(x + len, y + h); ctx.stroke()
+  ctx.strokeStyle = color; ctx.lineWidth = 3
+  ctx.shadowColor = color; ctx.shadowBlur = 8
+  ctx.beginPath(); ctx.moveTo(x, y + len);         ctx.lineTo(x, y);         ctx.lineTo(x + len, y);         ctx.stroke()
+  ctx.beginPath(); ctx.moveTo(x + w - len, y);     ctx.lineTo(x + w, y);     ctx.lineTo(x + w, y + len);     ctx.stroke()
+  ctx.beginPath(); ctx.moveTo(x, y + h - len);     ctx.lineTo(x, y + h);     ctx.lineTo(x + len, y + h);     ctx.stroke()
   ctx.beginPath(); ctx.moveTo(x + w - len, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - len); ctx.stroke()
   ctx.shadowBlur = 0
 }
 
 function drawCrosshairs(ctx, w, h) {
   const size = 12
-  ctx.strokeStyle = 'rgba(255,107,0,0.25)'
-  ctx.lineWidth   = 1
-  const corners = [[0, 0], [w, 0], [0, h], [w, h]]
-  corners.forEach(([cx, cy]) => {
+  ctx.strokeStyle = 'rgba(255,107,0,0.25)'; ctx.lineWidth = 1
+  ;[[0,0],[w,0],[0,h],[w,h]].forEach(([cx, cy]) => {
     const dx = cx === 0 ? size : -size
     const dy = cy === 0 ? size : -size
     ctx.beginPath(); ctx.moveTo(cx, cy + dy); ctx.lineTo(cx, cy); ctx.lineTo(cx + dx, cy); ctx.stroke()

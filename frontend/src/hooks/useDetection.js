@@ -8,11 +8,11 @@ import { useAuth } from '../context/AuthContext'
 import axios from 'axios'
 import toast from 'react-hot-toast'
 
-const BACKEND    = import.meta.env.VITE_BACKEND_URL || 'http://localhost:4000'
-const MAX_HISTORY = 60  // keep last 60 data points for charts
+const BACKEND     = import.meta.env.VITE_BACKEND_URL || 'http://localhost:4000'
+const MAX_HISTORY = 60
 
 export function useDetection() {
-  const { socket }  = useSocket()
+  const { socket }   = useSocket()
   const { getToken } = useAuth()
 
   const [status, setStatus] = useState({
@@ -23,16 +23,29 @@ export function useDetection() {
     fps:                 0,
     uptime_seconds:      0,
     is_running:          false,
+    mode:                'idle',
   })
 
-  const [logs,          setLogs]          = useState([])
+  const [logs,             setLogs]        = useState([])
   const [confidenceHistory, setConfHistory] = useState([])
-  const [isStarting,    setIsStarting]    = useState(false)
+  const [isStarting,       setIsStarting]  = useState(false)
 
-  const alarmRef  = useRef(null)
-  const wasFireRef = useRef(false)
+  const alarmRef    = useRef(null)
+  const prevFireRef = useRef(false)  // track previous fire state to avoid duplicate alarms
 
-  // ── Lazy-load alarm audio ─────────────────────────────
+  // ── Stable axios helper (won't change between renders) ──
+  const api = useCallback((config) => {
+    return axios({
+      ...config,
+      url:     `${BACKEND}${config.url}`,
+      headers: {
+        Authorization: `Bearer ${getToken()}`,
+        ...config.headers,
+      },
+    })
+  }, [getToken])
+
+  // ── Load alarm audio lazily ───────────────────────────
   function getAlarm() {
     if (!alarmRef.current) {
       alarmRef.current = new Audio('/alarm.mp3')
@@ -41,101 +54,103 @@ export function useDetection() {
     return alarmRef.current
   }
 
-  // ── Axios helper with auth header ─────────────────────
-  const api = useCallback((config) => {
-    return axios({
-      ...config,
-      url: `${BACKEND}${config.url}`,
-      headers: { Authorization: `Bearer ${getToken()}`, ...config.headers },
-    })
-  }, [getToken])
-
-  // ── Socket listeners ──────────────────────────────────
+  // ── Socket event listeners ────────────────────────────
   useEffect(() => {
     if (!socket) return
 
-    socket.on('status', (data) => {
+    // ── status update (every 500ms from backend) ─────────
+    function onStatus(data) {
       setStatus(data)
 
-      // Append to confidence history
+      // Append to confidence chart history
       setConfHistory(prev => {
-        const next = [...prev, {
-          time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        const point = {
+          time:       new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
           confidence: data.confidence,
-          fps: data.fps,
-        }]
-        return next.slice(-MAX_HISTORY)
+          fps:        data.fps,
+        }
+        return [...prev, point].slice(-MAX_HISTORY)
       })
-    })
 
-    socket.on('log', (entry) => {
-      setLogs(prev => [entry, ...prev].slice(0, 200))
-    })
-
-    socket.on('fire_detected', ({ confidence }) => {
-      if (!wasFireRef.current) {
-        wasFireRef.current = true
-        // Play alarm
-        try {
-          const alarm = getAlarm()
-          alarm.currentTime = 0
-          alarm.play().catch(() => {})
-        } catch {}
-        // Toast notification
-        toast.error(`🔥 FIRE DETECTED — ${confidence}% confidence`, {
-          duration: 5000,
-          style: {
-            background: '#FF2D00',
-            color: '#fff',
-            fontWeight: '600',
-            border: '1px solid #FF6B00',
-          },
-        })
+      // Clear alarm flag when fire stops
+      if (!data.fire_detected) {
+        prevFireRef.current = false
       }
-    })
+    }
 
-    // Reset alarm flag when fire clears
-    socket.on('status', (data) => {
-      if (!data.fire_detected) wasFireRef.current = false
-    })
+    // ── new fire detection event ──────────────────────────
+    function onFireDetected({ confidence }) {
+      if (prevFireRef.current) return  // already alarming
+      prevFireRef.current = true
 
-    // Load initial logs
+      // Play alarm sound
+      try {
+        const alarm = getAlarm()
+        alarm.currentTime = 0
+        alarm.play().catch(() => {})
+      } catch {}
+
+      // Toast notification
+      toast.error(`🔥 FIRE DETECTED — ${confidence}% confidence`, {
+        duration: 6000,
+        style: {
+          background: '#FF2D00',
+          color:      '#fff',
+          fontWeight: '700',
+          border:     '1px solid #FF6B00',
+          fontFamily: 'Rajdhani, sans-serif',
+          fontSize:   '15px',
+        },
+      })
+    }
+
+    // ── new log entry streamed in real-time ───────────────
+    function onLog(entry) {
+      setLogs(prev => [entry, ...prev].slice(0, 200))
+    }
+
+    socket.on('status',        onStatus)
+    socket.on('fire_detected', onFireDetected)
+    socket.on('log',           onLog)
+
+    // Load existing logs on mount
     api({ method: 'GET', url: '/api/logs', params: { limit: 100 } })
       .then(r => setLogs(r.data.logs || []))
       .catch(() => {})
 
     return () => {
-      socket.off('status')
-      socket.off('log')
-      socket.off('fire_detected')
+      socket.off('status',        onStatus)
+      socket.off('fire_detected', onFireDetected)
+      socket.off('log',           onLog)
     }
-  }, [socket, api])
+  }, [socket])   // only re-run if socket instance changes
 
-  // ── Start / Stop ──────────────────────────────────────
+  // ── Start detection ───────────────────────────────────
   async function startDetection() {
     setIsStarting(true)
     try {
       await api({ method: 'POST', url: '/api/start-detection' })
-      toast.success('Detection started')
-    } catch (e) {
+      toast.success('🔥 Detection started', { duration: 3000 })
+    } catch {
       toast.error('Failed to start detection')
     } finally {
       setIsStarting(false)
     }
   }
 
+  // ── Stop detection ────────────────────────────────────
   async function stopDetection() {
     try {
       await api({ method: 'POST', url: '/api/stop-detection' })
-      toast('Detection stopped', { icon: '⏹' })
+      toast('Detection stopped', { icon: '⏹', duration: 3000 })
     } catch {
       toast.error('Failed to stop detection')
     }
   }
 
-  async function exportCSV() {
-    const token = getToken()
-    window.open(`${BACKEND}/api/logs/export?token=${token}`, '_blank')
+  // ── Export CSV — opens download in new tab ────────────
+  function exportCSV() {
+    window.open(`${BACKEND}/api/logs/export?token=${getToken()}`, '_blank')
   }
 
   return {

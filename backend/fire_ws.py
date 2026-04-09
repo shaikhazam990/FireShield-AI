@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
-"""
-FireShield AI — Python Detection Bridge (fire_ws.py)
-Outputs JSON lines to stdout so Node.js can parse them.
-Run by the Node backend via child_process.spawn().
-"""
-import sys
-import json
-import time
-import math
-import os
-import argparse
-import threading
+import sys, json, time, math, os, argparse, threading
 from datetime import datetime
 
-# ── Optional imports (gracefully degrade) ─────────────────
 try:
     from ultralytics import YOLO
-    import cv2
-    import cvzone
+    import cv2, cvzone
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False
     print(json.dumps({"type": "warn", "message": "YOLO/OpenCV not installed — demo mode"}), flush=True)
 
 try:
-    from playsound import playsound
+    import pygame
+    pygame.mixer.init()
     SOUND_AVAILABLE = True
 except ImportError:
     SOUND_AVAILABLE = False
@@ -37,61 +25,74 @@ try:
 except ImportError:
     SMTP_AVAILABLE = False
 
-
-# ── Config ─────────────────────────────────────────────────
 CONFIDENCE_THRESHOLD = 0.75
-ALARM_COOLDOWN       = 2.0
 EMAIL_COOLDOWN       = 300
-ALARM_FILE           = 'alarm.mp3'
-DETECTIONS_DIR       = 'detections'
+ALARM_FILE           = os.path.join(os.path.dirname(__file__), 'alarm.mp3')
+DETECTIONS_DIR       = os.path.join(os.path.dirname(__file__), 'detections')
+SENDER_EMAIL         = os.getenv('SENDER_EMAIL', 'mrsimens72@gmail.com')
+SENDER_PASSWORD      = os.getenv('SENDER_PASSWORD', '')
+RECEIVER_EMAIL       = os.getenv('RECEIVER_EMAIL', 'shaikhazam0990@gmail.com')
 
-# Email (read from environment)
-SENDER_EMAIL    = os.getenv('SENDER_EMAIL', '')
-SENDER_PASSWORD = os.getenv('SENDER_PASSWORD', '')
-RECEIVER_EMAIL  = os.getenv('RECEIVER_EMAIL', '')
+alarm_playing = False
+alarm_lock    = threading.Lock()
 
-
-def emit(obj: dict):
-    """Print a JSON line to stdout for Node.js to parse."""
+def emit(obj):
     print(json.dumps(obj), flush=True)
 
+def start_alarm():
+    global alarm_playing
+    with alarm_lock:
+        if not alarm_playing and SOUND_AVAILABLE and os.path.exists(ALARM_FILE):
+            try:
+                pygame.mixer.music.load(ALARM_FILE)
+                pygame.mixer.music.play(-1)
+                alarm_playing = True
+                emit({"type": "alarm", "state": "on"})
+            except Exception as e:
+                emit({"type": "warn", "message": f"Alarm start failed: {e}"})
+
+def stop_alarm():
+    global alarm_playing
+    with alarm_lock:
+        if alarm_playing and SOUND_AVAILABLE:
+            try:
+                pygame.mixer.music.stop()
+                alarm_playing = False
+                emit({"type": "alarm", "state": "off"})
+            except Exception as e:
+                emit({"type": "warn", "message": f"Alarm stop failed: {e}"})
 
 def send_email():
-    if not SMTP_AVAILABLE or not SENDER_EMAIL:
+    if not SMTP_AVAILABLE or not SENDER_PASSWORD:
         return
     try:
         msg = MIMEMultipart()
         msg['From']    = SENDER_EMAIL
         msg['To']      = RECEIVER_EMAIL
         msg['Subject'] = 'FireShield AI — Fire Detected!'
-        body = f'Fire detected at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-        msg.attach(MIMEText(body, 'plain'))
+        msg.attach(MIMEText(f'Fire detected at {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', 'plain'))
         ctx = ssl.create_default_context()
         with smtplib.SMTP_SSL('smtp.gmail.com', 465, context=ctx) as s:
             s.login(SENDER_EMAIL, SENDER_PASSWORD)
             s.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+        emit({"type": "info", "message": "Email alert sent"})
     except Exception as e:
         emit({"type": "error", "message": f"Email failed: {e}"})
-
-
-def play_alarm_async():
-    if SOUND_AVAILABLE and os.path.exists(ALARM_FILE):
-        threading.Thread(target=playsound, args=(ALARM_FILE,), daemon=True).start()
-
 
 def save_screenshot(frame, confidence):
     if not os.path.exists(DETECTIONS_DIR):
         os.makedirs(DETECTIONS_DIR)
     ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
-    name = f'fire_{ts}_{int(confidence*100)}.jpg'
-    path = os.path.join(DETECTIONS_DIR, name)
-    cv2.imwrite(path, frame)
+    name = f'fire_{ts}_{int(confidence * 100)}.jpg'
+    cv2.imwrite(os.path.join(DETECTIONS_DIR, name), frame)
     return name
 
-
-def run_detection(model_path: str):
+def run_detection(model_path):
     if not YOLO_AVAILABLE:
         emit({"type": "error", "message": "YOLO not available"})
+        sys.exit(1)
+    if not os.path.exists(model_path):
+        emit({"type": "error", "message": f"Model not found: {model_path}"})
         sys.exit(1)
 
     emit({"type": "info", "message": f"Loading model: {model_path}"})
@@ -105,20 +106,23 @@ def run_detection(model_path: str):
         emit({"type": "error", "message": "No webcam found"})
         sys.exit(1)
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
 
-    # Warm up
-    for _ in range(10):
+    for _ in range(5):
         cap.read()
         time.sleep(0.05)
 
-    last_alarm_time = 0.0
     last_email_time = 0.0
-    fps_start   = time.time()
-    fps_counter = 0
-    fps_val     = 0.0
+    last_screenshot = 0.0
+    fps_start       = time.time()
+    fps_counter     = 0
+    fps_val         = 0.0
+    fire_streak     = 0
+    no_fire_streak  = 0
+    FIRE_TRIGGER    = 3
+    FIRE_RELEASE    = 8
 
     emit({"type": "info", "message": "Detection started"})
 
@@ -128,7 +132,9 @@ def run_detection(model_path: str):
             time.sleep(0.01)
             continue
 
-        results       = model(frame, stream=True, verbose=False)
+        frame   = cv2.resize(frame, (640, 480))
+        results = model(frame, stream=True, verbose=False)
+
         fire_detected = False
         best_conf     = 0.0
         now           = time.time()
@@ -141,14 +147,31 @@ def run_detection(model_path: str):
                     fire_detected = True
                     if conf > best_conf:
                         best_conf = conf
-
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
                     pct = math.ceil(conf * 100)
-                    cvzone.putTextRect(frame, f'fire {pct}%', [x1+8, y1+100],
-                                       scale=1.5, thickness=2, colorR=(180, 0, 0))
+                    cvzone.putTextRect(frame, f'fire {pct}%', [x1+8, y1+100], scale=1.5, thickness=2, colorR=(180,0,0))
 
-        # FPS
+        if fire_detected:
+            fire_streak   += 1
+            no_fire_streak = 0
+        else:
+            no_fire_streak += 1
+            fire_streak     = 0
+
+        if fire_streak >= FIRE_TRIGGER:
+            start_alarm()
+            if (now - last_screenshot) > 10.0:
+                name = save_screenshot(frame, best_conf)
+                last_screenshot = now
+                emit({"type": "screenshot", "filename": name, "confidence": round(best_conf * 100, 1)})
+            if (now - last_email_time) > EMAIL_COOLDOWN:
+                threading.Thread(target=send_email, daemon=True).start()
+                last_email_time = now
+
+        if no_fire_streak >= FIRE_RELEASE:
+            stop_alarm()
+
         fps_counter += 1
         elapsed = now - fps_start
         if elapsed >= 1.0:
@@ -156,18 +179,6 @@ def run_detection(model_path: str):
             fps_counter = 0
             fps_start   = now
 
-        # Alarm + email
-        if fire_detected:
-            if (now - last_alarm_time) > ALARM_COOLDOWN:
-                play_alarm_async()
-                last_alarm_time = now
-                save_screenshot(frame, best_conf)
-
-            if (now - last_email_time) > EMAIL_COOLDOWN:
-                threading.Thread(target=send_email, daemon=True).start()
-                last_email_time = now
-
-        # Emit JSON frame event to Node.js
         emit({
             "type":          "frame",
             "fire_detected": fire_detected,
@@ -178,9 +189,8 @@ def run_detection(model_path: str):
 
     cap.release()
 
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='models/fire.pt')
+    parser.add_argument('--model', default=os.path.join(os.path.dirname(__file__), 'models', 'fire.pt'))
     args = parser.parse_args()
     run_detection(args.model)

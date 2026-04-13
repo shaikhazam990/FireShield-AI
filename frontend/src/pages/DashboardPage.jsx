@@ -2,19 +2,18 @@
 //  Dashboard Page — full app shell with sidebar + tab views
 // ─────────────────────────────────────────────────────────
 import { useState } from 'react'
-import { Routes, Route, NavLink, useNavigate } from 'react-router-dom'
+import { Routes, Route, NavLink, useNavigate, useLocation } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useAuth } from '../context/AuthContext'
 import { useSocket } from '../context/SocketContext'
 import { useDetection } from '../hooks/useDetection'
 
-// Tab components
-import OverviewTab    from '../components/tabs/OverviewTab'
-import WebcamTab      from '../components/tabs/WebcamTab'
-import LogsTab        from '../components/tabs/LogsTab'
-import AnalyticsTab   from '../components/tabs/AnalyticsTab'
-import GalleryTab     from '../components/tabs/GalleryTab'
-import MapTab         from '../components/tabs/MapTab'
+import OverviewTab  from '../components/tabs/OverviewTab'
+import WebcamTab    from '../components/tabs/WebcamTab'
+import LogsTab      from '../components/tabs/LogsTab'
+import AnalyticsTab from '../components/tabs/AnalyticsTab'
+import GalleryTab   from '../components/tabs/GalleryTab'
+import MapTab       from '../components/tabs/MapTab'
 
 import {
   LayoutDashboard, Camera, ClipboardList,
@@ -22,20 +21,21 @@ import {
 } from 'lucide-react'
 
 const NAV = [
-  { path: '/',          label: 'Overview',   icon: LayoutDashboard },
-  { path: '/webcam',    label: 'Webcam',     icon: Camera },
-  { path: '/logs',      label: 'Logs',       icon: ClipboardList },
-  { path: '/analytics', label: 'Analytics',  icon: BarChart2 },
-  { path: '/gallery',   label: 'Gallery',    icon: Image },
-  { path: '/map',       label: 'Map View',   icon: Map },
+  { path: '/',          label: 'Overview',  icon: LayoutDashboard },
+  { path: '/webcam',    label: 'Webcam',    icon: Camera },
+  { path: '/logs',      label: 'Logs',      icon: ClipboardList },
+  { path: '/analytics', label: 'Analytics', icon: BarChart2 },
+  { path: '/gallery',   label: 'Gallery',   icon: Image },
+  { path: '/map',       label: 'Map View',  icon: Map },
 ]
 
 export default function DashboardPage() {
-  const { user, logout }        = useAuth()
-  const { connected }           = useSocket()
-  const detection               = useDetection()
+  const { user, logout }          = useAuth()
+  const { connected }             = useSocket()
+  const detection                 = useDetection()
   const [sidebarOpen, setSidebar] = useState(false)
-  const navigate                = useNavigate()
+  const navigate                  = useNavigate()
+  const location                  = useLocation()
 
   function handleLogout() {
     logout()
@@ -47,7 +47,7 @@ export default function DashboardPage() {
   return (
     <div className="flex min-h-screen bg-dark-900 bg-grid">
 
-      {/* ── Sidebar ─────────────────────────────────────── */}
+      {/* ── Sidebar ──────────────────────────────────── */}
       <aside className={`
         fixed inset-y-0 left-0 z-40 flex flex-col
         w-64 bg-dark-800 border-r border-white/5
@@ -131,7 +131,7 @@ export default function DashboardPage() {
         <div className="fixed inset-0 z-30 bg-black/60 lg:hidden" onClick={() => setSidebar(false)} />
       )}
 
-      {/* ── Main content ────────────────────────────────── */}
+      {/* ── Main content ─────────────────────────────── */}
       <div className="flex-1 flex flex-col min-w-0">
 
         {/* Top bar */}
@@ -159,7 +159,6 @@ export default function DashboardPage() {
           </AnimatePresence>
 
           <div className="flex items-center gap-3">
-            {/* Detection toggle */}
             {detection.status.is_running ? (
               <button
                 onClick={detection.stopDetection}
@@ -179,18 +178,16 @@ export default function DashboardPage() {
           </div>
         </header>
 
-        {/* Page content */}
+        {/* Page content — key prop prevents stale state across tab switches */}
         <main className="flex-1 p-4 lg:p-6 overflow-auto">
-          <AnimatePresence mode="wait">
-            <Routes>
-              <Route path="/"          element={<OverviewTab  detection={detection} />} />
-              <Route path="/webcam"    element={<WebcamTab    detection={detection} />} />
-              <Route path="/logs"      element={<LogsTab      detection={detection} />} />
-              <Route path="/analytics" element={<AnalyticsTab detection={detection} />} />
-              <Route path="/gallery"   element={<GalleryTab   detection={detection} />} />
-              <Route path="/map"       element={<MapTab       detection={detection} />} />
-            </Routes>
-          </AnimatePresence>
+          <Routes location={location} key={location.pathname}>
+            <Route path="/"          element={<OverviewTab  detection={detection} />} />
+            <Route path="/webcam"    element={<WebcamTab    detection={detection} />} />
+            <Route path="/logs"      element={<LogsTab      detection={detection} />} />
+            <Route path="/analytics" element={<AnalyticsTab detection={detection} />} />
+            <Route path="/gallery"   element={<GalleryTab   detection={detection} />} />
+            <Route path="/map"       element={<MapTab       detection={detection} />} />
+          </Routes>
         </main>
       </div>
     </div>

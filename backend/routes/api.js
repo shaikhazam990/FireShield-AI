@@ -30,14 +30,49 @@ router.get('/images', (req, res) => {
   const files = fs.readdirSync(detectionsDir)
     .filter(f => /\.(jpg|jpeg|png)$/i.test(f))
     .map(f => ({
-      filename: f,
-      url: `/detections/${f}`,
+      filename:  f,
+      url:       `/detections/${f}`,
       timestamp: fs.statSync(path.join(detectionsDir, f)).mtime.toISOString(),
     }))
     .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
     .slice(0, 50);
 
   res.json({ images: files });
+});
+
+// ── DELETE /api/images/:filename ──────────────────────────
+router.delete('/images/:filename', (req, res) => {
+  const filename = path.basename(req.params.filename); // prevent path traversal
+  const filePath = path.join(__dirname, '..', 'detections', filename);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  try {
+    fs.unlinkSync(filePath);
+    res.json({ success: true, message: `Deleted ${filename}` });
+  } catch (err) {
+    res.status(500).json({ error: `Failed to delete: ${err.message}` });
+  }
+});
+
+// ── DELETE /api/images ────────────────────────────────────
+router.delete('/images', (req, res) => {
+  const detectionsDir = path.join(__dirname, '..', 'detections');
+
+  if (!fs.existsSync(detectionsDir)) {
+    return res.json({ success: true, deleted: 0 });
+  }
+
+  try {
+    const files = fs.readdirSync(detectionsDir)
+      .filter(f => /\.(jpg|jpeg|png)$/i.test(f));
+    files.forEach(f => fs.unlinkSync(path.join(detectionsDir, f)));
+    res.json({ success: true, deleted: files.length });
+  } catch (err) {
+    res.status(500).json({ error: `Failed to delete all: ${err.message}` });
+  }
 });
 
 // ── POST /api/start-detection ─────────────────────────────
@@ -66,11 +101,10 @@ router.get('/analytics', (req, res) => {
 });
 
 // ── GET /api/logs/export ──────────────────────────────────
-// Returns CSV of all detection logs
 router.get('/logs/export', (req, res) => {
-  const logs = detectionService.getLogs(10000);
+  const logs   = detectionService.getLogs(10000);
   const header = 'timestamp,confidence,severity,fps\n';
-  const rows = logs.map(l =>
+  const rows   = logs.map(l =>
     `${l.timestamp},${l.confidence},${l.severity},${l.fps || ''}`
   ).join('\n');
 
